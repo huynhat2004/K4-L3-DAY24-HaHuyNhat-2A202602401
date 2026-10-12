@@ -59,7 +59,14 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from agent import ledger, policy, tools
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
@@ -69,6 +76,154 @@ class RunnerScaffoldPending(NotImplementedError):
     """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
 
 
+_TICKET_FILE_RE = re.compile(r"^ticket-(\d+)\.md$")
+_CUSTOMERS_PATH = Path(__file__).resolve().parent.parent / "data" / "customers.json"
+
+
+def _args_hash(arguments: dict) -> str:
+    encoded = json.dumps(arguments, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _record_decision(
+    *,
+    context: policy.PolicyContext,
+    arguments: dict,
+    ledger_path: Path,
+    agent_id: str,
+    run_id: str,
+) -> bool:
+    allowed, reason = policy.check(context)
+    ledger.append(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "tool": context.requested_tool,
+            "args_hash": _args_hash(arguments),
+            "classification": context.data_classification,
+            "decision": "allow" if allowed else "deny",
+            "reason": reason,
+            "on_behalf_of": context.principal_id,
+            "expires_at": context.expires_at,
+        },
+        ledger_path,
+    )
+    return allowed
+
+
+def _ticket_ids(docs: list[dict]) -> list[int]:
+    ids: set[int] = set()
+    for doc in docs:
+        match = _TICKET_FILE_RE.fullmatch(str(doc.get("id", "")))
+        if match:
+            ids.add(int(match.group(1)))
+    return sorted(ids)
+
+
+def _customers_for_tickets(ticket_ids: list[int]) -> list[str]:
+    wanted = set(ticket_ids)
+    customers = json.loads(_CUSTOMERS_PATH.read_text(encoding="utf-8"))
+    return sorted(
+        {
+            str(customer["customer_id"])
+            for customer in customers
+            if wanted.intersection(customer.get("related_tickets", []))
+        }
+    )
+
+
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    ledger_path = (Path(log_dir) if log_dir is not None else REPORTS_DIR) / "ledger.jsonl"
+    root_run_id = uuid.uuid4().hex
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    delegated_scopes = ("search_docs", "read_customer", "http_post")
+
+    # Run A owns untrusted content, but has no private-store or egress tool.
+    run_a_id = f"{root_run_id}:run-a"
+    run_a_agent = "lab24-agent/run-a"
+    search_context = policy.PolicyContext(
+        data_classification="internal",
+        request_purpose="summarize-tickets",
+        agent_owner=run_a_agent,
+        delegation_depth=0,
+        egress_enabled=False,
+        principal_id=principal_id,
+        requested_tool="search_docs",
+        agent_scopes=("search_docs",),
+        parent_scopes=(),
+        expires_at=expires_at,
+    )
+    docs: list[dict] = []
+    if _record_decision(
+        context=search_context,
+        arguments={"query": message},
+        ledger_path=ledger_path,
+        agent_id=run_a_agent,
+        run_id=run_a_id,
+    ):
+        docs = tools.search_docs(message)
+
+    combined_text = "\n\n".join(str(doc.get("text", "")) for doc in docs)
+    injected = llm.find_injection(combined_text)
+
+    # Run A xử lý toàn bộ tín hiệu lấy từ free text. Nếu nội dung không tin
+    # cậy yêu cầu egress, PEP ghi lại và chặn yêu cầu ngay tại đây, trước khi
+    # bất kỳ private record nào được đọc. Chỉ args_hash đi vào ledger; URL và
+    # document text không được chuyển sang Run B.
+    if injected is not None:
+        post_context = policy.PolicyContext(
+            data_classification="restricted",
+            request_purpose="support-reply",
+            agent_owner=run_a_agent,
+            delegation_depth=0,
+            egress_enabled=True,
+            principal_id=principal_id,
+            requested_tool="http_post",
+            agent_scopes=("search_docs",),
+            parent_scopes=(),
+            expires_at=expires_at,
+        )
+        _record_decision(
+            context=post_context,
+            arguments={"url": injected.target_url},
+            ledger_path=ledger_path,
+            agent_id=run_a_agent,
+            run_id=run_a_id,
+        )
+
+    # Đây là boundary duy nhất A -> B: typed ticket IDs lấy từ tên file.
+    # Không nội dung tự do hay customer_id do attacker viết được truyền qua.
+    ticket_ids = _ticket_ids(docs)
+
+    # Run B owns private-store access and derives customer IDs from trusted data.
+    run_b_id = f"{root_run_id}:run-b"
+    run_b_agent = "lab24-agent/run-b"
+    records: list[dict] = []
+    for customer_id in _customers_for_tickets(ticket_ids):
+        read_context = policy.PolicyContext(
+            data_classification="restricted",
+            request_purpose="support-reply",
+            agent_owner=run_b_agent,
+            delegation_depth=1,
+            egress_enabled=False,
+            principal_id=principal_id,
+            requested_tool="read_customer",
+            agent_scopes=("read_customer",),
+            parent_scopes=delegated_scopes,
+            expires_at=expires_at,
+        )
+        if _record_decision(
+            context=read_context,
+            arguments={"customer_id": customer_id},
+            ledger_path=ledger_path,
+            agent_id=run_b_agent,
+            run_id=run_b_id,
+        ):
+            try:
+                records.append(tools.read_customer(customer_id))
+            except tools.ToolError:
+                continue
+
+    return llm.summarize(docs)

@@ -30,10 +30,81 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+
+
+_PATTERNS = (
+    (
+        "EMAIL",
+        re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE),
+        0,
+        100,
+    ),
+    (
+        "VN_CCCD",
+        re.compile(r"\bCCCD\b[^\d]{0,20}(\d{12})\b", re.IGNORECASE),
+        1,
+        100,
+    ),
+    (
+        "VN_BANK_ACCOUNT",
+        re.compile(r"(?:\bSTK\b|số\s+tài\s+khoản)[^\d]{0,30}(\d{8,16})\b", re.IGNORECASE),
+        1,
+        100,
+    ),
+    (
+        "VN_PHONE",
+        re.compile(
+            r"(?:\bSĐT\b|số\s+điện\s+thoại(?:\s+liên\s+hệ)?)[^\d]{0,50}"
+            r"(0\d(?:[ -]?\d){8,9})\b",
+            re.IGNORECASE,
+        ),
+        1,
+        100,
+    ),
+    (
+        "VN_PHONE",
+        re.compile(r"(?<!\d)(0\d(?:[ -]?\d){8,9})(?!\d)"),
+        1,
+        20,
+    ),
+    (
+        "VN_CCCD",
+        re.compile(r"(?<!\d)(\d{12})(?!\d)"),
+        1,
+        10,
+    ),
+)
+
+
+def _overlaps(left: dict, right: dict) -> bool:
+    return left["start"] < right["end"] and right["start"] < left["end"]
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    candidates: list[tuple[int, dict]] = []
+    for entity_type, pattern, group, priority in _PATTERNS:
+        for match in pattern.finditer(text):
+            start, end = match.span(group)
+            candidates.append(
+                (priority, {"type": entity_type, "start": start, "end": end})
+            )
+
+    # Ưu tiên pattern có nhãn rõ ràng (CCCD/STK/SĐT) trước pattern fallback
+    # để một STK 12 số không bị nhận nhầm thành CCCD.
+    selected: list[dict] = []
+    for _, candidate in sorted(
+        candidates,
+        key=lambda item: (-item[0], item[1]["start"], item[1]["end"]),
+    ):
+        if not any(_overlaps(candidate, existing) for existing in selected):
+            selected.append(candidate)
+    return sorted(selected, key=lambda entity: (entity["start"], entity["end"]))
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    result = text
+    for entity in sorted(detect(text), key=lambda item: item["start"], reverse=True):
+        marker = f"[REDACTED_{entity['type']}]"
+        result = result[: entity["start"]] + marker + result[entity["end"] :]
+    return result

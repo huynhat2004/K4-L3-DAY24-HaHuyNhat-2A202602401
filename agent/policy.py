@@ -34,7 +34,13 @@ không phải xác thực người dùng production.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+PRINCIPALS_PATH = Path(__file__).resolve().parent.parent / "data" / "principals.json"
 
 
 @dataclass(frozen=True)
@@ -52,4 +58,40 @@ class PolicyContext:
 
 
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "restricted data is not allowed in an egress-enabled tool call"
+
+    if context.data_classification not in {"public", "internal", "restricted"}:
+        return False, f"unknown data classification: {context.data_classification!r}"
+    if context.delegation_depth < 0:
+        return False, "delegation depth cannot be negative"
+
+    principals = json.loads(PRINCIPALS_PATH.read_text(encoding="utf-8"))
+    principal = principals.get(context.principal_id)
+    if principal is None:
+        return False, f"unknown principal: {context.principal_id!r}"
+
+    try:
+        expires_at = datetime.fromisoformat(context.expires_at.replace("Z", "+00:00"))
+        if expires_at.tzinfo is None:
+            return False, "expires_at must include a timezone"
+        if expires_at <= datetime.now(timezone.utc):
+            return False, "delegated authorization has expired"
+    except (AttributeError, TypeError, ValueError):
+        return False, "expires_at is missing or invalid"
+
+    if context.request_purpose not in principal.get("purposes", []):
+        return False, f"purpose {context.request_purpose!r} is not allowed for principal"
+    if not context.requested_tool:
+        return False, "requested tool is missing"
+    if context.requested_tool not in principal.get("allowed_tools", []):
+        return False, f"principal is not allowed to use {context.requested_tool}"
+    if context.requested_tool not in context.agent_scopes:
+        return False, f"agent scope does not include {context.requested_tool}"
+    if context.delegation_depth > 0 and context.requested_tool not in context.parent_scopes:
+        return False, f"parent scope does not include {context.requested_tool}"
+
+    return True, (
+        f"principal {context.principal_id} may use {context.requested_tool} "
+        f"for purpose {context.request_purpose}"
+    )
