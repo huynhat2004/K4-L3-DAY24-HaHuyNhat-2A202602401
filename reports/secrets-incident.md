@@ -4,7 +4,7 @@
 - Commit chứa token giả: `1bdd849922156c868a5ee9293d68f5b72e242d2c` (`1bdd849`).
 - File, rule và kết quả quét lịch sử: `lab-fake-secret.txt`, rule
   `lab24-synthetic-token`; lệnh `gitleaks git --config .gitleaks.toml
-  --redact --verbose .` quét 7 commit, báo đúng 1 finding và trả exit code 1
+  --redact --verbose .` quét 8 commit, báo đúng 1 finding và trả exit code 1
   như dự kiến. Giá trị đã được redact trong output. Đây là token synthetic,
   vô hiệu được cài sẵn cho bài lab, không phải credential thật.
 - Kết quả quét file hiện tại: `gitleaks dir --config .gitleaks.toml --redact
